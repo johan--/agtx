@@ -232,6 +232,8 @@ struct AppState {
     spinner_frame: usize,
     // Idle detection: (content_hash, last_change_time) per task
     pane_content_hashes: HashMap<String, (u64, Instant)>,
+    // Guard: task IDs for which merge-conflict check has already been performed
+    merge_conflict_checked: HashSet<String>,
     cached_plugin: Option<Option<WorkflowPlugin>>,
     // Transient warning message shown in footer (auto-clears after a few seconds)
     warning_message: Option<(String, Instant)>,
@@ -292,6 +294,16 @@ struct SessionTaskStatus {
     phase_status: PhaseStatus,
     /// Content hash from tmux capture (for idle detection on main thread).
     content_hash: Option<u64>,
+    /// Task status (needed for merge-conflict check on main thread).
+    status: TaskStatus,
+    /// Worktree path (needed for merge-conflict check).
+    worktree_path: Option<String>,
+    /// Tmux session name (needed for merge-conflict check).
+    session_name: Option<String>,
+    /// Agent name (needed for merge-conflict skill dispatch).
+    agent: String,
+    /// Whether this task was already Ready before this refresh cycle.
+    was_ready: bool,
 }
 
 /// Results sent back from the background session refresh thread.
@@ -526,6 +538,7 @@ impl App {
                 phase_status_cache: HashMap::new(),
                 spinner_frame: 0,
                 pane_content_hashes: HashMap::new(),
+                merge_conflict_checked: HashSet::new(),
                 cached_plugin: None,
                 warning_message: None,
                 plugin_select_popup: None,
@@ -625,6 +638,7 @@ impl App {
                 phase_status_cache: HashMap::new(),
                 spinner_frame: 0,
                 pane_content_hashes: HashMap::new(),
+                merge_conflict_checked: HashSet::new(),
                 cached_plugin: None,
                 warning_message: None,
                 plugin_select_popup: None,
@@ -4220,7 +4234,7 @@ impl App {
             .map(|t| {
                 let was_ready = self.state.phase_status_cache.get(&t.id)
                     .map_or(false, |(prev, _)| *prev == PhaseStatus::Ready);
-                (t.id.clone(), t.status, t.worktree_path.clone(), t.plugin.clone(), t.session_name.clone(), t.cycle, was_ready)
+                (t.id.clone(), t.status, t.worktree_path.clone(), t.plugin.clone(), t.session_name.clone(), t.cycle, was_ready, t.agent.clone())
             })
             .collect();
 
@@ -4239,7 +4253,7 @@ impl App {
             let mut plugin_cache: HashMap<Option<String>, Option<WorkflowPlugin>> = HashMap::new();
             let mut statuses = Vec::new();
 
-            for (task_id, status, worktree_path, task_plugin, session_name, cycle, was_ready) in tasks_to_check {
+            for (task_id, status, worktree_path, task_plugin, session_name, cycle, was_ready, agent) in tasks_to_check {
                 let plugin = plugin_cache.entry(task_plugin.clone()).or_insert_with(|| {
                     match &task_plugin {
                         Some(name) => WorkflowPlugin::load(name, project_path.as_deref()).ok(),
@@ -4314,6 +4328,11 @@ impl App {
                     task_id,
                     phase_status,
                     content_hash,
+                    status,
+                    worktree_path,
+                    session_name,
+                    agent,
+                    was_ready,
                 });
             }
 
@@ -4344,7 +4363,58 @@ impl App {
                 self.state.pane_content_hashes.remove(&task_status.task_id);
             }
 
-            self.state.phase_status_cache.insert(task_status.task_id, (phase, now));
+            self.state.phase_status_cache.insert(task_status.task_id.clone(), (phase, now));
+
+            // Auto merge-conflict check for Review tasks
+            if task_status.status == TaskStatus::Review && !self.state.merge_conflict_checked.contains(&task_status.task_id) {
+                let newly_ready = phase == PhaseStatus::Ready && !task_status.was_ready;
+                let should_check = match phase {
+                    PhaseStatus::Ready => newly_ready,
+                    PhaseStatus::Idle => {
+                        self.state.pane_content_hashes.get(&task_status.task_id)
+                            .map_or(false, |(_, last_change)| {
+                                now.duration_since(*last_change) >= std::time::Duration::from_secs(30)
+                            })
+                    }
+                    _ => false,
+                };
+
+                if should_check {
+                    if let (Some(ref wt), Some(ref sn)) = (&task_status.worktree_path, &task_status.session_name) {
+                        if self.state.tmux_ops.window_exists(sn).unwrap_or(false) {
+                            self.state.merge_conflict_checked.insert(task_status.task_id.clone());
+
+                            let git_ops = Arc::clone(&self.state.git_ops);
+                            let tmux_ops = Arc::clone(&self.state.tmux_ops);
+                            let wt = wt.clone();
+                            let sn = sn.clone();
+                            let agent_name = task_status.agent.clone();
+
+                            std::thread::spawn(move || {
+                                match git_ops.fetch_and_check_conflicts(Path::new(&wt)) {
+                                    Ok(true) => {
+                                        let skill_cmd = skills::transform_plugin_command(
+                                            "/agtx:merge-conflicts",
+                                            &agent_name,
+                                        );
+                                        send_skill_and_prompt(
+                                            &tmux_ops,
+                                            &sn,
+                                            &skill_cmd,
+                                            "The feature branch has merge conflicts with the default branch. Please resolve them now.",
+                                            &None,
+                                            "",
+                                            &agent_name,
+                                            &[],
+                                        );
+                                    }
+                                    Ok(false) | Err(_) => {}
+                                }
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
@@ -4385,6 +4455,9 @@ impl App {
 
         // Ensure tmux session exists
         ensure_project_tmux_session(&project.name, &project_path, self.state.tmux_ops.as_ref());
+
+        // Clear per-task caches from previous project
+        self.state.merge_conflict_checked.clear();
 
         // Reload tasks for new project
         self.refresh_tasks()?;
