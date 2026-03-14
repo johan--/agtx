@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use crate::agent::{self, AgentOperations};
 use crate::config::{GlobalConfig, MergedConfig, ProjectConfig, ThemeConfig, WorkflowPlugin};
-use crate::db::{Database, PhaseStatus, Task, TaskStatus};
+use crate::db::{Database, PhaseStatus, Task, TaskStatus, TransitionRequest};
 use crate::git::{self, GitOperations, GitProviderOperations, PullRequestState, RealGitHubOps, RealGitOps};
 use crate::skills;
 use crate::tmux::{self, RealTmuxOps, TmuxOperations};
@@ -158,6 +158,7 @@ const SHELL_POPUP_HEIGHT_PERCENT: u16 = 75; // Percentage of terminal height
 /// Application state (separate from terminal for borrow checker)
 struct AppState {
     mode: AppMode,
+    flags: crate::FeatureFlags,
     should_quit: bool,
     board: BoardState,
     input_mode: InputMode,
@@ -239,6 +240,12 @@ struct AppState {
     warning_message: Option<(String, Instant)>,
     // Plugin selection popup
     plugin_select_popup: Option<PluginSelectPopup>,
+    // Orchestrator agent tmux target (e.g. "project:orchestrator")
+    orchestrator_session: Option<String>,
+    // Orchestrator idle detection for push notifications
+    orchestrator_last_content: String,
+    orchestrator_stable_since: Option<Instant>,
+    orchestrator_last_check: Instant,
     // Background session refresh channel (non-blocking phase status polling)
     session_refresh_rx: Option<mpsc::Receiver<SessionRefreshResult>>,
 }
@@ -431,9 +438,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mode: AppMode) -> Result<Self> {
+    pub fn new(mode: AppMode, flags: crate::FeatureFlags) -> Result<Self> {
         Self::with_ops(
             mode,
+            flags,
             Arc::new(RealTmuxOps),
             Arc::new(RealGitOps),
             Arc::new(RealGitHubOps),
@@ -443,6 +451,7 @@ impl App {
 
     pub fn with_ops(
         mode: AppMode,
+        flags: crate::FeatureFlags,
         tmux_ops: Arc<dyn TmuxOperations>,
         git_ops: Arc<dyn GitOperations>,
         git_provider_ops: Arc<dyn GitProviderOperations>,
@@ -492,6 +501,7 @@ impl App {
             terminal,
             state: AppState {
                 mode,
+                flags,
                 should_quit: false,
                 board: BoardState::new(),
                 input_mode: InputMode::Normal,
@@ -542,6 +552,10 @@ impl App {
                 cached_plugin: None,
                 warning_message: None,
                 plugin_select_popup: None,
+                orchestrator_session: None,
+                orchestrator_last_content: String::new(),
+                orchestrator_stable_since: None,
+                orchestrator_last_check: Instant::now(),
                 session_refresh_rx: None,
             },
         };
@@ -556,6 +570,47 @@ impl App {
         app.refresh_tasks()?;
         // Load projects from global database
         app.refresh_projects()?;
+
+        // Detect existing orchestrator session (survives agtx restarts)
+        if app.state.flags.experimental {
+            let orch_target = format!("{}:orchestrator", app.state.project_name);
+            if app.state.tmux_ops.window_exists(&orch_target).unwrap_or(false) {
+                app.state.orchestrator_session = Some(orch_target);
+
+                // Catch up: notify orchestrator about tasks that completed while TUI was down
+                if let Some(ref db) = app.state.db {
+                    // Check existing notifications to avoid duplicates
+                    let existing: HashSet<String> = db.peek_notifications()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|n| n.message)
+                        .collect();
+
+                    for task in &app.state.board.tasks {
+                        if !matches!(task.status, TaskStatus::Planning | TaskStatus::Running) {
+                            continue;
+                        }
+                        let plugin = match &task.plugin {
+                            Some(name) => WorkflowPlugin::load(name, app.state.project_path.as_deref()).ok(),
+                            None => skills::load_bundled_plugin("agtx"),
+                        };
+                        if let Some(ref wt) = task.worktree_path {
+                            if phase_artifact_exists(wt, task.status, &plugin, task.cycle) {
+                                let short_id = if task.id.len() >= 8 { &task.id[..8] } else { &task.id };
+                                let message = format!(
+                                    "Task \"{}\" ({}) completed phase: {}",
+                                    task.title, short_id, task.status.as_str()
+                                );
+                                if !existing.contains(&message) {
+                                    let notif = crate::db::Notification::new(message);
+                                    let _ = db.create_notification(&notif);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(app)
     }
@@ -592,6 +647,7 @@ impl App {
             terminal,
             state: AppState {
                 mode,
+                flags: crate::FeatureFlags::default(),
                 should_quit: false,
                 board: BoardState::new(),
                 input_mode: InputMode::Normal,
@@ -642,6 +698,10 @@ impl App {
                 cached_plugin: None,
                 warning_message: None,
                 plugin_select_popup: None,
+                orchestrator_session: None,
+                orchestrator_last_content: String::new(),
+                orchestrator_stable_since: None,
+                orchestrator_last_check: Instant::now(),
                 session_refresh_rx: None,
             },
         })
@@ -714,6 +774,9 @@ impl App {
                 }
             }
 
+            // Process MCP transition requests from the command queue
+            self.process_transition_requests()?;
+
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
@@ -743,6 +806,9 @@ impl App {
             }
             // Spawn background refresh if not already running and cache expired
             self.maybe_spawn_session_refresh();
+
+            // Deliver queued notifications to orchestrator when idle
+            self.deliver_orchestrator_notifications();
 
             // Clear expired warning messages
             if let Some((_, created)) = &self.state.warning_message {
@@ -811,11 +877,19 @@ impl App {
         // Header
         let plugin_label = state.config.workflow_plugin.as_deref().unwrap_or("agtx");
         let left = Span::styled(format!(" {} ", state.project_name), Style::default().fg(Color::Cyan).bold());
-        let right_spans: Vec<Span> = vec![
+        let mut right_spans: Vec<Span> = Vec::new();
+        if state.flags.experimental {
+            let orch_active = state.orchestrator_session.is_some();
+            if orch_active {
+                right_spans.push(Span::styled("● ", Style::default().fg(Color::Green)));
+                right_spans.push(Span::styled("orchestrator ", Style::default().fg(Color::Green)));
+            }
+            right_spans.push(Span::styled("[O] ", Style::default().fg(hex_to_color(&state.config.theme.color_dimmed))));
+        }
+        right_spans.extend([
             Span::styled(format!("{} ", plugin_label), Style::default().fg(hex_to_color(&state.config.theme.color_accent))),
             Span::styled("[P] ", Style::default().fg(hex_to_color(&state.config.theme.color_dimmed))),
-            Span::styled("Plugins ", Style::default().fg(hex_to_color(&state.config.theme.color_dimmed))),
-        ];
+        ]);
         let left_len = state.project_name.len() + 2;
         let right_len: usize = right_spans.iter().map(|s| s.content.len()).sum();
         let padding = (chunks[0].width as usize).saturating_sub(left_len + right_len + 2); // 2 for borders
@@ -2089,12 +2163,12 @@ impl App {
     }
 
     fn open_plugin_select_popup(&mut self) {
-        let current = self.state.config.workflow_plugin.as_deref().unwrap_or("");
+        let current = self.state.config.workflow_plugin.as_deref().unwrap_or("agtx");
         let mut options = vec![PluginOption {
-            name: String::new(),
+            name: "agtx".to_string(),
             label: "agtx".to_string(),
             description: "Built-in workflow with skills and prompts".to_string(),
-            active: current.is_empty(),
+            active: current == "agtx",
         }];
         for (name, desc, _content) in skills::BUNDLED_PLUGINS {
             if *name == "agtx" { continue; }
@@ -2144,8 +2218,8 @@ impl App {
         // Load current project config
         let mut project_config = ProjectConfig::load(&project_path).unwrap_or_default();
 
-        if plugin_name.is_empty() {
-            // Clear plugin
+        if plugin_name.is_empty() || plugin_name == "agtx" {
+            // agtx is the default — clear explicit setting
             project_config.workflow_plugin = None;
         } else {
             // Find bundled plugin content and write it
@@ -2767,6 +2841,10 @@ impl App {
                 // Open plugin selection popup
                 self.open_plugin_select_popup();
             }
+            KeyCode::Char('O') if self.state.flags.experimental => {
+                // Toggle orchestrator agent (experimental)
+                self.toggle_orchestrator()?;
+            }
             _ => {}
         }
         Ok(())
@@ -3285,6 +3363,8 @@ impl App {
                 task.referenced_tasks = refs;
                 // Task starts in Backlog without tmux window
                 db.create_task(&task)?;
+
+                // No orchestrator notification for Backlog — orchestrator only manages Planning/Running
             }
             self.refresh_tasks()?;
         }
@@ -3298,18 +3378,18 @@ impl App {
                 .and_then(|db| db.get_task(task_id).ok().flatten())
                 .and_then(|t| t.plugin.clone())
                 .or_else(|| self.state.config.workflow_plugin.clone())
-                .unwrap_or_default()
+                .unwrap_or_else(|| "agtx".to_string())
         } else {
-            self.state.config.workflow_plugin.as_deref().unwrap_or("").to_string()
+            self.state.config.workflow_plugin.as_deref().unwrap_or("agtx").to_string()
         };
 
         let selected_agent_name = &self.state.config.default_agent;
 
         let mut options = vec![PluginOption {
-            name: String::new(),
+            name: "agtx".to_string(),
             label: "agtx".to_string(),
             description: "Built-in workflow with skills and prompts".to_string(),
-            active: current.is_empty(),
+            active: current == "agtx",
         }];
         for (name, desc, content) in skills::BUNDLED_PLUGINS {
             if *name == "agtx" { continue; }
@@ -3466,6 +3546,7 @@ impl App {
                     db.update_task(&task)?;
                 }
             }
+
         }
         self.refresh_tasks()?;
         Ok(())
@@ -3902,11 +3983,21 @@ impl App {
 
     /// Move task directly from Backlog to Running (skip Planning)
     fn move_backlog_to_running(&mut self) -> Result<()> {
+        let task_id = match self.state.board.selected_task() {
+            Some(t) if t.status == TaskStatus::Backlog => t.id.clone(),
+            _ => return Ok(()),
+        };
+        self.move_backlog_to_running_by_id(&task_id)
+    }
+
+    fn move_backlog_to_running_by_id(&mut self, task_id: &str) -> Result<()> {
         // Don't start if a setup is already in progress
-        if self.state.setup_rx.is_some() { return Ok(()) }
+        if self.state.setup_rx.is_some() {
+            anyhow::bail!("Another task setup is already in progress, try again shortly");
+        }
 
         let (mut task, project_path) = match (
-            self.state.board.selected_task().cloned(),
+            self.state.db.as_ref().and_then(|db| db.get_task(task_id).ok().flatten()),
             self.state.project_path.clone(),
         ) {
             (Some(t), Some(p)) => (t, p),
@@ -3914,7 +4005,7 @@ impl App {
         };
 
         if task.status != TaskStatus::Backlog {
-            return Ok(());
+            anyhow::bail!("Task must be in Backlog to move to Running (current: {})", task.status.as_str());
         }
 
         // Stamp plugin on task before checking research requirement
@@ -4137,6 +4228,310 @@ impl App {
         Ok(())
     }
 
+    // === MCP Transition Request Processing ===
+
+    /// Poll the transition_requests table for unprocessed requests and execute them.
+    fn process_transition_requests(&mut self) -> Result<()> {
+        let Some(db) = &self.state.db else { return Ok(()) };
+        let pending = db.get_pending_transition_requests()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        for req in pending {
+            let result = self.execute_transition_request(&req);
+            if let Some(db) = &self.state.db {
+                match &result {
+                    Ok(()) => {
+                        let _ = db.mark_transition_processed(&req.id, None);
+                    }
+                    Err(e) => {
+                        let _ = db.mark_transition_processed(&req.id, Some(&e.to_string()));
+                    }
+                }
+            }
+            self.refresh_tasks()?;
+        }
+
+        // Periodically clean up old processed requests
+        if let Some(db) = &self.state.db {
+            let _ = db.cleanup_old_transition_requests();
+        }
+
+        Ok(())
+    }
+
+    fn execute_transition_request(&mut self, req: &TransitionRequest) -> Result<()> {
+        let Some(db) = &self.state.db else {
+            anyhow::bail!("No project database");
+        };
+        let Some(project_path) = self.state.project_path.clone() else {
+            anyhow::bail!("No project path");
+        };
+
+        let mut task = db
+            .get_task(&req.task_id)?
+            .ok_or_else(|| anyhow::anyhow!("Task not found: {}", req.task_id))?;
+
+        match req.action.as_str() {
+            "research" => {
+                if task.status != TaskStatus::Backlog {
+                    anyhow::bail!(
+                        "Task must be in Backlog to start research (current: {})",
+                        task.status.as_str()
+                    );
+                }
+                if task.session_name.is_some() {
+                    anyhow::bail!("Task already has an active session (research may already be running)");
+                }
+                self.start_research(&req.task_id)?;
+            }
+            "move_forward" => {
+                self.execute_forward_transition(&mut task, &project_path)?;
+            }
+            "move_to_planning" => {
+                if task.status != TaskStatus::Backlog {
+                    anyhow::bail!(
+                        "Task must be in Backlog to move to Planning (current: {})",
+                        task.status.as_str()
+                    );
+                }
+                self.execute_forward_transition(&mut task, &project_path)?;
+            }
+            "move_to_running" => {
+                if task.status != TaskStatus::Planning && task.status != TaskStatus::Backlog {
+                    anyhow::bail!(
+                        "Task must be in Backlog or Planning to move to Running (current: {})",
+                        task.status.as_str()
+                    );
+                }
+                if task.status == TaskStatus::Backlog {
+                    self.move_backlog_to_running_by_id(&req.task_id)?;
+                } else {
+                    self.execute_forward_transition(&mut task, &project_path)?;
+                }
+            }
+            "move_to_review" => {
+                if task.status != TaskStatus::Running {
+                    anyhow::bail!(
+                        "Task must be in Running to move to Review (current: {})",
+                        task.status.as_str()
+                    );
+                }
+                self.mcp_transition_to_review(&mut task)?;
+            }
+            "move_to_done" => {
+                if task.status != TaskStatus::Review {
+                    anyhow::bail!(
+                        "Task must be in Review to move to Done (current: {})",
+                        task.status.as_str()
+                    );
+                }
+                self.force_move_to_done(&task.id)?;
+            }
+            "resume" => {
+                if task.status != TaskStatus::Review {
+                    anyhow::bail!(
+                        "Task must be in Review to resume (current: {})",
+                        task.status.as_str()
+                    );
+                }
+                self.move_review_to_running(&req.task_id)?;
+            }
+            other => {
+                anyhow::bail!("Unknown action: {}", other);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute a forward transition (next column), mirroring move_task_right logic.
+    fn execute_forward_transition(&mut self, task: &mut Task, project_path: &Path) -> Result<()> {
+        let next_status = match task.status {
+            TaskStatus::Backlog => TaskStatus::Planning,
+            TaskStatus::Planning => TaskStatus::Running,
+            TaskStatus::Running => TaskStatus::Review,
+            TaskStatus::Review => TaskStatus::Done,
+            TaskStatus::Done => anyhow::bail!("Task is already Done"),
+        };
+
+        // Skip the phase-incomplete confirmation for MCP requests
+        let handled = match (task.status, next_status) {
+            (TaskStatus::Backlog, TaskStatus::Planning) => {
+                if self.state.setup_rx.is_some() {
+                    anyhow::bail!("Another task setup is already in progress, try again shortly");
+                }
+                self.transition_to_planning(task, project_path)?
+            }
+            (TaskStatus::Planning, TaskStatus::Running) => self.transition_to_running(task)?,
+            (TaskStatus::Running, TaskStatus::Review) => {
+                self.mcp_transition_to_review(task)?;
+                return Ok(());
+            }
+            (TaskStatus::Review, TaskStatus::Done) => {
+                self.force_move_to_done(&task.id)?;
+                return Ok(());
+            }
+            _ => false,
+        };
+
+        if !handled {
+            task.status = next_status;
+            task.updated_at = chrono::Utc::now();
+            if let Some(db) = &self.state.db {
+                db.update_task(task)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// MCP version of transition_to_review: sends review prompt but skips PR popup.
+    fn mcp_transition_to_review(&mut self, task: &mut Task) -> Result<()> {
+        let (review_agent, agent_switch) = needs_agent_switch(&self.state.config, task, "review");
+        if let Some(session_name) = &task.session_name {
+            let plugin = self.load_task_plugin(task);
+            let task_content = task.content_text();
+            let skill_cmd =
+                resolve_skill_command(&plugin, "review", &review_agent, &task_content, task.cycle);
+            let prompt =
+                resolve_prompt(&plugin, "review", &task_content, &task.id, task.cycle);
+            let prompt_trigger = resolve_prompt_trigger(&plugin, "review");
+            let auto_dismiss = plugin
+                .as_ref()
+                .map_or_else(Vec::new, |p| p.auto_dismiss.clone());
+            spawn_send_to_agent(
+                Arc::clone(&self.state.tmux_ops),
+                Arc::clone(&self.state.agent_registry),
+                session_name.clone(),
+                task.agent.clone(),
+                review_agent.clone(),
+                agent_switch,
+                skill_cmd,
+                prompt,
+                prompt_trigger,
+                task_content,
+                auto_dismiss,
+            );
+        }
+        task.agent = review_agent;
+        task.status = TaskStatus::Review;
+        task.updated_at = chrono::Utc::now();
+        if let Some(db) = &self.state.db {
+            db.update_task(task)?;
+        }
+        Ok(())
+    }
+
+    /// Toggle orchestrator agent: spawn if not running, view if running.
+    fn toggle_orchestrator(&mut self) -> Result<()> {
+        let project_path = match &self.state.project_path {
+            Some(p) => p.clone(),
+            None => {
+                self.state.warning_message = Some((
+                    "Orchestrator requires a project (not dashboard mode)".to_string(),
+                    Instant::now(),
+                ));
+                return Ok(());
+            }
+        };
+
+        let project_name = self.state.project_name.clone();
+        let window_name = "orchestrator";
+        let orch_target = format!("{}:{}", project_name, window_name);
+
+        // If orchestrator is running, open the popup to view it
+        if let Some(ref orch_target) = self.state.orchestrator_session {
+            if self.state.tmux_ops.window_exists(orch_target).unwrap_or(false) {
+                let mut popup = ShellPopup::new("Orchestrator".to_string(), orch_target.clone());
+                if let Ok((_term_width, term_height)) = crossterm::terminal::size() {
+                    let pane_width = SHELL_POPUP_CONTENT_WIDTH;
+                    let popup_height = (term_height as u32 * SHELL_POPUP_HEIGHT_PERCENT as u32 / 100) as u16;
+                    let pane_height = popup_height.saturating_sub(4);
+                    let _ = self.state.tmux_ops.resize_window(orch_target, pane_width, pane_height);
+                    popup.last_pane_size = Some((pane_width, pane_height));
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                popup.cached_content = capture_tmux_pane_with_history(orch_target, 500, self.state.tmux_ops.as_ref());
+                self.state.shell_popup = Some(popup);
+                return Ok(());
+            } else {
+                // Window gone, clear the session
+                self.state.orchestrator_session = None;
+            }
+        }
+
+        // Spawn new orchestrator
+        let default_agent = self.state.config.default_agent.clone();
+        let agent = self.state.agent_registry.get(&default_agent);
+        let project_path_str = project_path.to_string_lossy().to_string();
+
+        // Build MCP registration JSON for the agtx server
+        let agtx_bin = std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("agtx"))
+            .to_string_lossy()
+            .to_string();
+        let mcp_json = serde_json::json!({
+            "type": "stdio",
+            "command": agtx_bin,
+            "args": ["mcp-serve", &project_path_str]
+        });
+        let mcp_json_str = mcp_json.to_string().replace('\'', "'\\''");
+
+        // Build agent command: register MCP in local scope, launch agent, clean up on exit
+        // --scope local stores in ~/.claude.json tied to project path (not in project files)
+        let agent_base = agent.build_interactive_command("");
+        let agent_cmd = match default_agent.as_str() {
+            "claude" => format!(
+                "claude mcp add-json agtx '{}' --scope local && {}; claude mcp remove agtx --scope local",
+                mcp_json_str, agent_base
+            ),
+            _ => agent_base,
+        };
+
+        // Ensure project tmux session exists
+        ensure_project_tmux_session(&project_name, &project_path, self.state.tmux_ops.as_ref());
+
+        // Create orchestrator tmux window in the project root (no worktree)
+        self.state.tmux_ops.create_window(
+            &project_name,
+            window_name,
+            &project_path_str,
+            Some(agent_cmd),
+        )?;
+
+        self.state.orchestrator_session = Some(orch_target.clone());
+
+        // Open the popup immediately so the user can see the orchestrator starting
+        let mut popup = ShellPopup::new("Orchestrator".to_string(), orch_target.clone());
+        if let Ok((_term_width, term_height)) = crossterm::terminal::size() {
+            let pane_width = SHELL_POPUP_CONTENT_WIDTH;
+            let popup_height = (term_height as u32 * SHELL_POPUP_HEIGHT_PERCENT as u32 / 100) as u16;
+            let pane_height = popup_height.saturating_sub(4);
+            let _ = self.state.tmux_ops.resize_window(&orch_target, pane_width, pane_height);
+            popup.last_pane_size = Some((pane_width, pane_height));
+        }
+        popup.cached_content = capture_tmux_pane_with_history(&orch_target, 500, self.state.tmux_ops.as_ref());
+        self.state.shell_popup = Some(popup);
+
+        // Deploy orchestrate skill to project root so the agent can discover it
+        deploy_skill(&project_path, "agtx-orchestrate", skills::ORCHESTRATE_SKILL, &default_agent);
+
+        // Send the /agtx:orchestrate command once the agent is ready
+        let skill_cmd = skills::transform_plugin_command("/agtx:orchestrate", &default_agent)
+            .unwrap_or_else(|| "/agtx:orchestrate".to_string());
+        let tmux_ops = Arc::clone(&self.state.tmux_ops);
+        let target = orch_target;
+        std::thread::spawn(move || {
+            if let Some(ready_target) = wait_for_agent_ready(&tmux_ops, &target) {
+                let _ = tmux_ops.send_keys(&ready_target, &skill_cmd);
+            }
+        });
+
+        Ok(())
+    }
+
     fn open_selected_task(&mut self) -> Result<()> {
         if let Some(task) = self.state.board.selected_task() {
             if let Some(window_name) = &task.session_name.clone() {
@@ -4208,6 +4603,70 @@ impl App {
         Ok(())
     }
 
+    /// Push queued notifications to the orchestrator's tmux pane, but only when idle.
+    /// Runs every 2s. Idle = pane content unchanged for ≥3s.
+    fn deliver_orchestrator_notifications(&mut self) {
+        // Only check every 2 seconds
+        if self.state.orchestrator_last_check.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        self.state.orchestrator_last_check = Instant::now();
+
+        let orch_target = match &self.state.orchestrator_session {
+            Some(t) => t.clone(),
+            None => return,
+        };
+
+        // Check window still exists
+        if !self.state.tmux_ops.window_exists(&orch_target).unwrap_or(false) {
+            return;
+        }
+
+        // Capture current pane content (bottom portion for comparison)
+        let current_content = self.state.tmux_ops
+            .capture_pane(&orch_target)
+            .unwrap_or_default();
+
+        if current_content != self.state.orchestrator_last_content {
+            // Content changed — agent is working, reset idle timer
+            self.state.orchestrator_last_content = current_content;
+            self.state.orchestrator_stable_since = Some(Instant::now());
+            return;
+        }
+
+        // Content unchanged — check if stable long enough (≥3s)
+        let stable_since = match self.state.orchestrator_stable_since {
+            Some(t) => t,
+            None => {
+                self.state.orchestrator_stable_since = Some(Instant::now());
+                return;
+            }
+        };
+
+        if stable_since.elapsed() < std::time::Duration::from_secs(3) {
+            return;
+        }
+
+        // Orchestrator is idle — deliver pending notifications
+        let db = match &self.state.db {
+            Some(db) => db,
+            None => return,
+        };
+
+        let notifications = match db.consume_notifications() {
+            Ok(n) if !n.is_empty() => n,
+            _ => return,
+        };
+
+        let messages: Vec<String> = notifications.iter().map(|n| n.message.clone()).collect();
+        let combined = format!("[agtx] {}", messages.join(" | "));
+        let _ = self.state.tmux_ops.send_keys(&orch_target, &combined);
+
+        // Reset idle tracking since we just sent input
+        self.state.orchestrator_last_content.clear();
+        self.state.orchestrator_stable_since = None;
+    }
+
     /// Spawn a background thread to check phase statuses if no refresh is already running
     /// and the cache has expired for at least one task.
     fn maybe_spawn_session_refresh(&mut self) {
@@ -4232,8 +4691,10 @@ impl App {
                     .map_or(true, |(_, ts)| now.duration_since(*ts) >= CACHE_TTL)
             })
             .map(|t| {
+                // was_ready: true if previously Ready OR not in cache yet (first poll after startup).
+                // This avoids false "newly ready" notifications for tasks that were already done before restart.
                 let was_ready = self.state.phase_status_cache.get(&t.id)
-                    .map_or(false, |(prev, _)| *prev == PhaseStatus::Ready);
+                    .map_or(true, |(prev, _)| *prev == PhaseStatus::Ready);
                 (t.id.clone(), t.status, t.worktree_path.clone(), t.plugin.clone(), t.session_name.clone(), t.cycle, was_ready, t.agent.clone())
             })
             .collect();
@@ -4363,11 +4824,30 @@ impl App {
                 self.state.pane_content_hashes.remove(&task_status.task_id);
             }
 
+            let newly_ready = phase == PhaseStatus::Ready && !task_status.was_ready;
             self.state.phase_status_cache.insert(task_status.task_id.clone(), (phase, now));
+
+            // Notify orchestrator when a phase completes (newly Ready)
+            if newly_ready {
+                if self.state.orchestrator_session.is_some() {
+                    if let Some(db) = &self.state.db {
+                        let task_title = self.state.board.tasks.iter()
+                            .find(|t| t.id == task_status.task_id)
+                            .map(|t| t.title.as_str())
+                            .unwrap_or("unknown");
+                        let phase_name = if task_status.status == TaskStatus::Backlog { "research" } else { task_status.status.as_str() };
+                        let short_id = if task_status.task_id.len() >= 8 { &task_status.task_id[..8] } else { &task_status.task_id };
+                        let notif = crate::db::Notification::new(format!(
+                            "Task \"{}\" ({}) completed phase: {}",
+                            task_title, short_id, phase_name
+                        ));
+                        let _ = db.create_notification(&notif);
+                    }
+                }
+            }
 
             // Auto merge-conflict check for Review tasks
             if task_status.status == TaskStatus::Review && !self.state.merge_conflict_checked.contains(&task_status.task_id) {
-                let newly_ready = phase == PhaseStatus::Ready && !task_status.was_ready;
                 let should_check = match phase {
                     PhaseStatus::Ready => newly_ready,
                     PhaseStatus::Idle => {
@@ -5938,9 +6418,12 @@ fn wait_for_agent_ready(tmux_ops: &Arc<dyn TmuxOperations>, target: &str) -> Opt
 }
 
 /// Load the workflow plugin for a task, checking agent compatibility.
+/// Tries disk first (project-local → global), then falls back to bundled plugins.
 fn load_task_plugin(task: &Task, project_path: Option<&Path>, default_agent: &str) -> Option<WorkflowPlugin> {
     let plugin = match &task.plugin {
-        Some(name) => WorkflowPlugin::load(name, project_path).ok(),
+        Some(name) => WorkflowPlugin::load(name, project_path)
+            .ok()
+            .or_else(|| skills::load_bundled_plugin(name)),
         None => skills::load_bundled_plugin("agtx"),
     };
     if let Some(ref p) = plugin {
@@ -6052,6 +6535,51 @@ fn write_skills_to_worktree(worktree_path: &str, project_path: &Path, plugin: &O
                     }
                 }
             }
+        }
+    }
+}
+
+/// Deploy a single skill to a target directory for the given agent.
+/// Writes both the canonical `.agtx/skills/` copy and the agent-native discovery path.
+fn deploy_skill(target_dir: &Path, skill_name: &str, content: &str, agent_name: &str) {
+    // Write canonical copy
+    let canonical_dir = target_dir.join(".agtx/skills").join(skill_name);
+    let _ = std::fs::create_dir_all(&canonical_dir);
+    let _ = std::fs::write(canonical_dir.join("SKILL.md"), content);
+
+    // Write to agent-native discovery path
+    if let Some((base_dir, namespace)) = skills::agent_native_skill_dir(agent_name) {
+        let native_dir = if namespace.is_empty() {
+            target_dir.join(base_dir)
+        } else {
+            target_dir.join(base_dir).join(namespace)
+        };
+        let _ = std::fs::create_dir_all(&native_dir);
+
+        match agent_name {
+            "claude" | "copilot" => {
+                let transformed = transform_skill_frontmatter(content);
+                let filename = skills::skill_dir_to_filename(skill_name, agent_name);
+                let _ = std::fs::write(native_dir.join(&filename), transformed);
+            }
+            "gemini" => {
+                let description = skills::extract_description(content)
+                    .unwrap_or_else(|| format!("agtx {} skill", skill_name));
+                let toml_content = skills::skill_to_gemini_toml(&description, content);
+                let filename = skills::skill_dir_to_filename(skill_name, agent_name);
+                let _ = std::fs::write(native_dir.join(&filename), toml_content);
+            }
+            "codex" => {
+                let skill_subdir = native_dir.join(skill_name);
+                let _ = std::fs::create_dir_all(&skill_subdir);
+                let _ = std::fs::write(skill_subdir.join("SKILL.md"), content);
+            }
+            "opencode" => {
+                let oc_content = transform_skill_for_opencode(content);
+                let filename = skills::skill_dir_to_filename(skill_name, agent_name);
+                let _ = std::fs::write(native_dir.join(&filename), oc_content);
+            }
+            _ => {}
         }
     }
 }

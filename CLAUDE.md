@@ -13,14 +13,17 @@ cargo build --release
 
 # Or run in dashboard mode (no git project required)
 ./target/release/agtx -g
+
+# Enable experimental features (orchestrator agent)
+./target/release/agtx --experimental
 ```
 
 ## Architecture
 
 ```
 src/
-├── main.rs           # Entry point, CLI arg parsing, AppMode enum
-├── lib.rs            # Module exports for integration tests
+├── main.rs           # Entry point, CLI arg parsing, AppMode enum, FeatureFlags
+├── lib.rs            # Module exports, AppMode, FeatureFlags
 ├── skills.rs         # Skill constants, agent-native paths, plugin command translation
 ├── tui/
 │   ├── mod.rs        # Re-exports
@@ -32,7 +35,7 @@ src/
 ├── db/
 │   ├── mod.rs        # Re-exports
 │   ├── schema.rs     # Database struct, SQLite operations
-│   └── models.rs     # Task, Project, TaskStatus enums
+│   └── models.rs     # Task, Project, TaskStatus, Notification enums
 ├── tmux/
 │   ├── mod.rs        # Tmux server "agtx", session management
 │   └── operations.rs # TmuxOperations trait (mockable for testing)
@@ -44,6 +47,9 @@ src/
 ├── agent/
 │   ├── mod.rs        # Agent definitions, detection, spawn args
 │   └── operations.rs # AgentOperations/CodingAgent traits (mockable)
+├── mcp/
+│   ├── mod.rs        # Re-exports
+│   └── server.rs     # MCP server (JSON-RPC over stdio) for orchestrator
 └── config/
     └── mod.rs        # GlobalConfig, ProjectConfig, ThemeConfig, WorkflowPlugin
 
@@ -54,7 +60,9 @@ skills/                # Built-in skill files (embedded at compile time)
 └── research.md        # Research phase instructions
 
 plugins/               # Bundled plugin configs (embedded at compile time)
-├── agtx/plugin.toml   # Default workflow with skills and prompts
+├── agtx/
+│   ├── plugin.toml    # Default workflow with skills and prompts
+│   └── skills/orchestrate.md # Orchestrator agent skill (experimental)
 ├── gsd/plugin.toml    # Get Shit Done workflow
 ├── spec-kit/plugin.toml # GitHub spec-kit workflow
 ├── openspec/plugin.toml # OpenSpec specification framework
@@ -68,6 +76,7 @@ tests/
 ├── board_tests.rs     # Board navigation tests
 ├── git_tests.rs       # Git worktree tests
 ├── agent_tests.rs     # Agent detection and spawn args tests
+├── mcp_tests.rs       # MCP server tests
 ├── mock_infrastructure_tests.rs # Mock infrastructure tests
 └── shell_popup_tests.rs         # Shell popup logic tests
 ```
@@ -103,11 +112,11 @@ Plugins customize the task lifecycle per phase. A plugin is a TOML file (`plugin
 - **supported_agents**: Agent whitelist (empty = all supported)
 - **auto_dismiss**: Rules to auto-dismiss interactive prompts before sending the task prompt
 
-Phase gating is derived from the config: if a phase's command or prompt contains `{task}`, the phase can be entered directly from Backlog. Otherwise, it requires a prior phase artifact. This replaces the old `research_required` flag — all behavior is now inferred from the plugin TOML.
+Phase gating is derived from the config: if a phase's command or prompt contains `{task}`, the phase can be entered directly from Backlog. Otherwise, it requires a prior phase artifact. If a phase has no command AND no prompt (e.g. void plugin), it is ungated and can be entered freely. This replaces the old `research_required` flag — all behavior is now inferred from the plugin TOML.
 
-Plugin resolution: project-local `.agtx/plugins/{name}/` → global `~/.config/agtx/plugins/{name}/` → bundled.
+Plugin resolution: project-local `.agtx/plugins/{name}/` → global `~/.config/agtx/plugins/{name}/` → bundled. `load_task_plugin` falls back to bundled plugins when disk load fails, so tasks always resolve their plugin correctly even if the on-disk copy is missing.
 
-Each task stores its plugin name in the database at creation time. Switching the project plugin only affects new tasks.
+Each task stores its plugin name explicitly in the database at creation time (e.g. `Some("agtx")`, `Some("gsd")`). Switching the project plugin only affects new tasks.
 
 ### Skill System
 Skills are markdown files with YAML frontmatter deployed to agent-native discovery paths in worktrees:
@@ -168,6 +177,30 @@ Structure:
 - View sessions: `tmux -L agtx list-windows -a`
 - Attach: `tmux -L agtx attach`
 
+### Orchestrator Agent (Experimental)
+A dedicated Claude Code agent that autonomously manages the kanban board. Enabled with `--experimental`, toggled with `O`.
+
+```
+┌─────────────┐     MCP (stdio)     ┌──────────────┐     SQLite     ┌─────┐
+│ Orchestrator │ ←──────────────────→ │  MCP Server  │ ←────────────→ │ DB  │
+│ (Claude Code)│                     │ (agtx serve) │               └──┬──┘
+└──────┬───────┘                     └──────────────┘                  │
+       │  send_keys (push-when-idle)                                   │
+┌──────┴───────┐                                                       │
+│   TUI (agtx) │ ←────────────────────────────────────────────────────┘
+└──────────────┘
+```
+
+- **Orchestrator → TUI**: `transition_requests` DB table (commands like "move task X forward")
+- **TUI → Orchestrator**: `notifications` DB table, pushed via `send_keys` when orchestrator is idle
+- MCP registered per-session via `claude mcp add-json --scope local`, cleaned up on exit
+- Orchestrator only manages Planning and Running phases; the user triages Backlog/Research manually and handles merging in Review/Done
+- Orchestrator is a coordinator, not a reviewer — it moves tasks forward immediately when phases complete, without inspecting output
+- Only "completed phase" notifications are sent (no "entered phase" notifications)
+- On startup, if an orchestrator tmux session already exists, it is detected and reconnected; catch-up notifications are created for tasks that completed phases while the TUI was down (deduplicated via `peek_notifications`)
+
+**MCP tools**: `list_tasks`, `get_task` (includes `allowed_actions`), `move_task`, `get_transition_status`, `check_conflicts`, `get_notifications`
+
 ### Theme Configuration
 Colors configurable via `~/.config/agtx/config.toml`:
 ```toml
@@ -198,6 +231,7 @@ color_popup_header = "#69fae7"  # Popup headers (light cyan)
 | `r` | Resume task (Review → Running) |
 | `/` | Search tasks (jumps to and opens task) |
 | `P` | Select workflow plugin |
+| `O` | Toggle orchestrator agent (experimental) |
 | `e` | Toggle project sidebar |
 | `q` | Quit |
 
@@ -373,4 +407,5 @@ Detected automatically via `known_agents()` in order of preference:
 
 ## Future Enhancements
 - Reopen Done tasks (recreate worktree from preserved branch)
-- Notification when agent finishes work
+- Orchestrator: support non-Claude agents as orchestrator
+- Orchestrator: task deletion notifications

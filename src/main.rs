@@ -1,4 +1,4 @@
-use agtx::{agent, config::{self, GlobalConfig}, git, tui, AppMode};
+use agtx::{agent, config::{self, GlobalConfig}, git, tui, AppMode, FeatureFlags};
 use anyhow::Result;
 use crossterm::{
     cursor,
@@ -14,7 +14,26 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
 
-    let mode = match args.get(1).map(|s| s.as_str()) {
+    // Extract flags (--experimental) from any position
+    let experimental = args.iter().any(|a| a == "--experimental");
+    let positional_args: Vec<&str> = args.iter()
+        .skip(1)
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .collect();
+
+    let mode = match positional_args.first().copied() {
+        Some("mcp-serve") => {
+            let project_path = positional_args
+                .get(1)
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir()?);
+            let project_path = project_path.canonicalize()?;
+            if !git::is_git_repo(&project_path) {
+                anyhow::bail!("mcp-serve requires a git project directory");
+            }
+            return agtx::mcp::serve(project_path).await;
+        }
         Some("-g") => AppMode::Dashboard,
         Some(".") => AppMode::Project(std::env::current_dir()?),
         Some(path) => AppMode::Project(PathBuf::from(path)),
@@ -28,6 +47,8 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    let flags = FeatureFlags { experimental };
 
     // First-run: determine action based on config/data state
     let config_path = GlobalConfig::config_path()?;
@@ -58,7 +79,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize and run the app
-    let mut app = tui::App::new(mode)?;
+    let mut app = tui::App::new(mode, flags)?;
     app.run().await?;
 
     Ok(())
