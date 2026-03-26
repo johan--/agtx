@@ -163,8 +163,8 @@ pub struct WorktreeConfig {
     #[serde(default = "default_true")]
     pub auto_cleanup: bool,
 
-    /// Base branch to create worktrees from
-    #[serde(default = "default_base_branch")]
+    /// Base branch to create worktrees from (empty = auto-detect main/master)
+    #[serde(default)]
     pub base_branch: String,
 }
 
@@ -173,17 +173,13 @@ impl Default for WorktreeConfig {
         Self {
             enabled: true,
             auto_cleanup: true,
-            base_branch: "main".to_string(),
+            base_branch: String::new(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
-}
-
-fn default_base_branch() -> String {
-    "main".to_string()
 }
 
 /// Project-specific configuration (stored in .agtx/config.toml)

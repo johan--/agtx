@@ -54,7 +54,7 @@ fn test_global_config_default() {
     assert_eq!(config.default_agent, "claude");
     assert!(config.worktree.enabled);
     assert!(config.worktree.auto_cleanup);
-    assert_eq!(config.worktree.base_branch, "main");
+    assert_eq!(config.worktree.base_branch, "");
 }
 
 // === WorktreeConfig Tests ===
@@ -65,7 +65,7 @@ fn test_worktree_config_default() {
 
     assert!(config.enabled);
     assert!(config.auto_cleanup);
-    assert_eq!(config.base_branch, "main");
+    assert_eq!(config.base_branch, "");
 }
 
 // === ProjectConfig Tests ===
@@ -91,7 +91,7 @@ fn test_merged_config_uses_global_defaults() {
     let merged = MergedConfig::merge(&global, &project);
 
     assert_eq!(merged.default_agent, "claude");
-    assert_eq!(merged.base_branch, "main");
+    assert_eq!(merged.base_branch, "");
     assert!(merged.worktree_enabled);
     assert!(merged.auto_cleanup);
     assert!(merged.copy_files.is_none());
