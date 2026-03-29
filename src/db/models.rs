@@ -1,3 +1,4 @@
+use crate::tmux::safe_session_name;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +116,7 @@ impl Task {
 
     /// Generate tmux session name: task-{id}--{project}--{slug}
     pub fn generate_session_name(&self, project_name: &str) -> String {
+        let project_name = safe_session_name(project_name);
         let slug = self
             .title
             .to_lowercase()
